@@ -2,91 +2,105 @@
 package docker
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
+	"os"
 	"strings"
+
+	"github.com/ahugues/docker-update-watcher/version"
 )
 
-type SemVer struct {
-	Major int
-	Minor int
-	Rev   int
-}
-
-func (v *SemVer) Equal(cmp *SemVer) bool {
-	return v.Major == cmp.Major && v.Minor == cmp.Minor && v.Rev == cmp.Rev
-}
-
-func (v *SemVer) Lower(cmp *SemVer) bool {
-	return (v.Major < cmp.Major) || (v.Major == cmp.Major && v.Minor < cmp.Minor) || (v.Major == cmp.Major && v.Minor == cmp.Minor && v.Rev < cmp.Rev)
-}
-
-func NewSemVer(raw string) (ret *SemVer, err error) {
-	vals := strings.Split(raw, ".")
-	if len(vals) == 0 {
-		return nil, errors.New("invalid format")
-	}
-	ret.Major, err = strconv.Atoi(vals[0])
-	if err != nil {
-		return nil, fmt.Errorf("Invalid major version %s: %w", vals[0], err)
-	}
-	if len(vals) < 2 {
-		return
-	}
-	ret.Minor, err = strconv.Atoi(vals[1])
-	if err != nil {
-		return nil, fmt.Errorf("Invalid minor version %s: %w", vals[1], err)
-	}
-	if len(vals) < 3 {
-		return
-	}
-	if err != nil {
-		return nil, fmt.Errorf("Invalid revision %s: %w", vals[1], err)
-	}
-	return
-}
-
-type VersionLatest string
-
-type Versioner interface {
-	Lower(cmp Versioner) bool
+type jsonImage struct {
+	Name         string `json:"name"`
+	Version      string `json:"version"`
+	OS           string `json:"os"`
+	Architecture string `json:"architecture"`
+	Digest       string `json:"digest"`
 }
 
 type Image struct {
-	Name    string
-	Version interface{}
-	Digest  string
+	Namespace    string
+	Name         string
+	Version      version.Version
+	Digest       string
+	Architecture string
+	OS           string
+}
+
+func (i *Image) UnmarshalJSON(data []byte) error {
+	var jsonI jsonImage
+	if err := json.Unmarshal(data, &jsonI); err != nil {
+		return err
+	}
+
+	separatedName := strings.Split(jsonI.Name, "/")
+	switch len(separatedName) {
+	case 1:
+		i.Name = separatedName[0]
+	case 2:
+		i.Name = separatedName[1]
+		i.Namespace = separatedName[0]
+	default:
+		return fmt.Errorf("invalid name %q", jsonI.Name)
+	}
+
+	i.Digest = jsonI.Digest
+
+	switch jsonI.Version {
+	case "latest":
+		i.Version = &version.VersionLatest{}
+	default:
+		var err error
+		if i.Version, err = version.NewSemVer(jsonI.Version); err != nil {
+			return fmt.Errorf("invalid version %s: %w", jsonI.Version, err)
+		}
+	}
+	return nil
 }
 
 // NeedUpdate returns true if the given image is newer than the current one
 func (i *Image) NeedUpdate(comp *Image) (bool, error) {
 	switch currentVer := i.Version.(type) {
-	case SemVer:
-		return i.needUpdateSemVer(&currentVer, comp)
-	case VersionLatest:
+	case *version.SemVer:
+		return i.needUpdateSemVer(currentVer, comp)
+	case *version.VersionLatest:
 		return i.needUpdateLatest(comp)
 	default:
-		return nil
+		return false, errors.New("invalid version type")
 	}
 }
 
 func (i *Image) needUpdateLatest(cmp *Image) (bool, error) {
-	versionStr, ok := cmp.Version.(string)
+	_, ok := cmp.Version.(*version.VersionLatest)
 	if !ok {
 		return false, errors.New("failed to compare version latest")
-	}
-	if versionStr != "latest" {
-		return false, fmt.Errorf("unexpected version %s", versionStr)
 	}
 	return i.Digest != cmp.Digest, nil
 }
 
-func (i *Image) needUpdateSemVer(currentVersion *SemVer, cmp *Image) (bool, error) {
+func (i *Image) needUpdateSemVer(currentVersion *version.SemVer, cmp *Image) (bool, error) {
 	switch cmpVer := cmp.Version.(type) {
-	case SemVer:
-		return currentVersion.Lower(&cmpVer), nil
+	case *version.SemVer:
+		return currentVersion.Older(cmpVer), nil
 	default:
 		return false, errors.New("failed to compare semver versions")
 	}
+}
+
+type initialConf struct {
+	Images []Image `json:"initial-images"`
+}
+
+func ReadInitialConfig(confLocation string) (*[]Image, error) {
+	content, err := os.ReadFile(confLocation)
+	if err != nil {
+		return nil, errors.New("failed to read initial list of images")
+	}
+
+	var res initialConf
+	if err := json.Unmarshal(content, &res); err != nil {
+		return nil, errors.New("failed to parse initial list of images")
+	}
+	return &(res.Images), nil
 }
